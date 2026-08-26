@@ -4,24 +4,46 @@ import torch.nn.functional as F
 from .utils import select_low_loss_indices, get_ot_pair
 
 class MACWrapper:
-    def __init__(self, model, vae=None, add_weight=0.1, ln=True, model_type='full'):
+    def __init__(
+        self,
+        model,
+        vae=None,
+        add_weight=0.1,
+        ln=True,
+        model_type='full',
+        one_step_weight=0.0,
+        local_weight=0.0,
+        local_delta=0.05,
+    ):
         self.model = model
         self.vae = vae
         self.ema_model = copy.deepcopy(model).eval()
         self.ln = ln
+
         self.BOOTSTRAP_EVERY = 8
         self.DENOISE_TIMESTEPS = 128
         self.CLASS_DROPOUT_PROB = 0.1
         self.NUM_CLASSES = 10
+
         self.decay = 0.999
         self.add_weight = add_weight
-        self.time_mu=0.4
-        self.time_sigma=1.0
-        self.ratio_r_not_equal_t = 0.25 
 
-        self.norm_p=0.75
-        self.norm_eps=1e-3
+        self.time_mu = 0.4
+        self.time_sigma = 1.0
+        self.ratio_r_not_equal_t = 0.25
+
+        self.norm_p = 0.75
+        self.norm_eps = 1e-3
+
         self.model_type = model_type
+
+        # ===== NEW =====
+        self.one_step_weight = one_step_weight
+        self.local_weight = local_weight
+        self.local_delta = local_delta
+
+        if not (0.0 < local_delta < 1.0):
+            raise ValueError("local_delta must be in (0, 1)")
 
     @torch.no_grad()
     def update_ema(self):
@@ -66,28 +88,228 @@ class MACWrapper:
         return r, t 
 
     def get_loss(self, images, z0, labels, indices=None):
+
         self.ema_model.eval()
-
-        if self.add_weight==0:
-            weights = torch.ones(images.shape[0], device=images.device)
-        else:
-            if indices is not None:
-                weights = torch.ones(images.shape[0], device=images.device)
-                weights[indices] = 1 + self.add_weight
-
+    
         device = images.device
-        current_batch_size = images.shape[0]
-        r, t = self.sample_time_steps("logit_normal", current_batch_size, device)
-        t_full, r_full = t.view(-1, 1, 1, 1), r.view(-1, 1, 1, 1)
-
-        # get dx at timestep t
-        # x_t = (1 - (1-1e-5) * t_full)*x_0 + t_full*x_1
+        B = images.shape[0]
+    
+        # =====================================================
+        # 1. Existing MeanFlow loss
+        # =====================================================
+    
+        r, t = self.sample_time_steps(
+            "logit_normal",
+            B,
+            device
+        )
+    
+        t_full = t.view(-1, 1, 1, 1)
+        r_full = r.view(-1, 1, 1, 1)
+    
         x_t = (1 - t_full) * z0 + t_full * images
-
-        ut_gt = (images - z0)
-        
-        labels_dropout = torch.bernoulli(torch.full(labels.shape, self.CLASS_DROPOUT_PROB)).to(images.device)
-        labels_dropped = torch.where(labels_dropout.bool(), self.NUM_CLASSES, labels)
+    
+        # conditional velocity
+        ut_gt = images - z0
+    
+        labels_dropout = torch.bernoulli(
+            torch.full(labels.shape, self.CLASS_DROPOUT_PROB)
+        ).to(device)
+    
+        labels_dropped = torch.where(
+            labels_dropout.bool(),
+            self.NUM_CLASSES,
+            labels
+        )
+    
+        def u_func(z, t_in, r_in):
+            h = r_in - t_in
+            return self.model(
+                z,
+                t_in,
+                h,
+                labels_dropped
+            )
+    
+        dtdt = torch.ones_like(t)
+        drdt = torch.zeros_like(r)
+    
+        with torch.amp.autocast("cuda", enabled=False):
+    
+            u_pred, dudt = torch.func.jvp(
+                u_func,
+                (x_t, t, r),
+                (ut_gt, dtdt, drdt)
+            )
+    
+            u_tgt = (
+                ut_gt
+                + (r_full - t_full) * dudt
+            ).detach()
+    
+            mf_sq = (
+                (u_pred - u_tgt) ** 2
+            ).sum(dim=(1, 2, 3))
+    
+            mf_per_sample = self.adaptive_per_sample(
+                mf_sq
+            )
+    
+        # =====================================================
+        # 2. Existing MAC weighting
+        # =====================================================
+    
+        if indices is not None:
+    
+            weights = torch.ones(
+                B,
+                device=device
+            )
+    
+            weights[indices] = (
+                1.0 + self.add_weight
+            )
+    
+            mf_loss = (
+                mf_per_sample * weights
+            ).mean()
+    
+        else:
+    
+            mf_loss = mf_per_sample.mean()
+    
+        total_loss = mf_loss
+    
+        # =====================================================
+        # 3. NEW: direct 1-step loss
+        # =====================================================
+    
+        if self.one_step_weight > 0:
+    
+            t0 = torch.zeros(
+                B,
+                device=device
+            )
+    
+            h1 = torch.ones(
+                B,
+                device=device
+            )
+    
+            u_one = self.model(
+                z0,
+                t0,
+                h1,
+                labels_dropped
+            )
+    
+            # actual one-step generated endpoint
+            x1_hat = z0 + u_one
+    
+            one_step_sq = (
+                (x1_hat - images) ** 2
+            ).sum(dim=(1, 2, 3))
+    
+            one_step_per_sample = (
+                self.adaptive_per_sample(
+                    one_step_sq
+                )
+            )
+    
+            one_step_loss = self.selected_mean(
+                one_step_per_sample,
+                indices
+            )
+    
+            total_loss = (
+                total_loss
+                + self.one_step_weight
+                * one_step_loss
+            )
+    
+        # =====================================================
+        # 4. NEW: local endpoint consistency
+        # =====================================================
+    
+        if self.local_weight > 0:
+    
+            delta = self.local_delta
+    
+            # random local position
+            s = torch.rand(
+                B,
+                device=device
+            ) * (1.0 - delta)
+    
+            s_next = s + delta
+    
+            s_full = s.view(-1, 1, 1, 1)
+            sn_full = s_next.view(-1, 1, 1, 1)
+    
+            # two nearby points on the SAME training path
+            x_s = (
+                (1.0 - s_full) * z0
+                + s_full * images
+            )
+    
+            x_sn = (
+                (1.0 - sn_full) * z0
+                + sn_full * images
+            )
+    
+            # remaining horizon until t=1
+            h_s = 1.0 - s
+            h_sn = 1.0 - s_next
+    
+            u_s = self.model(
+                x_s,
+                s,
+                h_s,
+                labels_dropped
+            )
+    
+            u_sn = self.model(
+                x_sn,
+                s_next,
+                h_sn,
+                labels_dropped
+            )
+    
+            # predicted final endpoint from each nearby point
+            x1_hat_s = (
+                x_s
+                + h_s.view(-1, 1, 1, 1)
+                * u_s
+            )
+    
+            x1_hat_sn = (
+                x_sn
+                + h_sn.view(-1, 1, 1, 1)
+                * u_sn
+            )
+    
+            local_sq = (
+                (x1_hat_s - x1_hat_sn) ** 2
+            ).sum(dim=(1, 2, 3))
+    
+            local_per_sample = (
+                self.adaptive_per_sample(
+                    local_sq
+                )
+            )
+    
+            local_loss = self.selected_mean(
+                local_per_sample,
+                indices
+            )
+    
+            total_loss = (
+                total_loss
+                + self.local_weight
+                * local_loss
+            )
+    
+        return total_loss
         
         def u_func(z, t_in, r_in):
             h = r_in - t_in
@@ -180,3 +402,19 @@ class MACWrapper:
         images.append(decoded)
 
         return images
+
+#add
+def adaptive_per_sample(self, loss_per_sample):
+    adp_wt = (loss_per_sample.detach() + self.norm_eps) ** self.norm_p
+
+    return loss_per_sample / adp_wt
+
+
+def selected_mean(self, loss_per_sample, indices):
+    if indices is None:
+        return loss_per_sample.mean()
+
+    if indices.numel() == 0:
+        return loss_per_sample.mean() * 0.0
+
+    return loss_per_sample[indices].mean()
