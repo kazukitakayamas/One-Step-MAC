@@ -183,6 +183,27 @@ if __name__ == '__main__':
     parser.add_argument('--method', type=str, default='meanflow', choices=['meanflow', 'flow_matching', 'shortcut', 'batchot'])
     parser.add_argument('--model_type', type=str, default='select', choices=['select', 'full'])
     parser.add_argument('--ckpt_path', type=str, default=None)
+
+    #add
+    parser.add_argument(
+        '--one_step_weight',
+        type=float,
+        default=0.0
+    )
+    
+    parser.add_argument(
+        '--local_weight',
+        type=float,
+        default=0.0
+    )
+    
+    parser.add_argument(
+        '--local_delta',
+        type=float,
+        default=0.05
+    )
+
+    
     args = parser.parse_args()
 
     if args.method == 'meanflow':
@@ -286,7 +307,17 @@ if __name__ == '__main__':
         'model_type': args.model_type,
     }
     # build model + MAC wrapper
-    mac = MACWrapper(model, vae, args.add_weight, model_type=args.model_type)
+    # mac = MACWrapper(model, vae, args.add_weight, model_type=args.model_type)
+    mac = MACWrapper(
+        model,
+        vae,
+        args.add_weight,
+        model_type=args.model_type,
+        one_step_weight=args.one_step_weight,
+        local_weight=args.local_weight,
+        local_delta=args.local_delta,
+    )
+    
     model_pl = MACModulePL(hparams, mac)
 
     checkpoint_callback = ModelCheckpoint(
