@@ -308,15 +308,24 @@ if __name__ == '__main__':
     }
     # build model + MAC wrapper
     # mac = MACWrapper(model, vae, args.add_weight, model_type=args.model_type)
-    mac = MACWrapper(
-        model,
-        vae,
-        args.add_weight,
-        model_type=args.model_type,
-        one_step_weight=args.one_step_weight,
-        local_weight=args.local_weight,
-        local_delta=args.local_delta,
-    )
+    if args.method == 'meanflow':
+        mac = MACWrapper(
+            model,
+            vae,
+            args.add_weight,
+            model_type=args.model_type,
+            one_step_weight=args.one_step_weight,
+            local_weight=args.local_weight,
+            local_delta=args.local_delta,
+        )
+    else:
+        # Preserve the original constructors for the other wrappers.
+        mac = MACWrapper(
+            model,
+            vae,
+            args.add_weight,
+            model_type=args.model_type,
+        )
     
     model_pl = MACModulePL(hparams, mac)
 
