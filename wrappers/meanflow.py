@@ -87,6 +87,19 @@ class MACWrapper:
         
         return r, t 
 
+    def adaptive_per_sample(self, loss_per_sample):
+        adp_wt = (loss_per_sample.detach() + self.norm_eps) ** self.norm_p
+        return loss_per_sample / adp_wt
+
+    def selected_mean(self, loss_per_sample, indices):
+        if indices is None:
+            return loss_per_sample.mean()
+
+        if indices.numel() == 0:
+            return loss_per_sample.mean() * 0.0
+
+        return loss_per_sample[indices].mean()
+
     def get_loss(self, images, z0, labels, indices=None):
 
         self.ema_model.eval()
@@ -310,31 +323,6 @@ class MACWrapper:
             )
     
         return total_loss
-        
-        def u_func(z, t_in, r_in):
-            h = r_in - t_in
-            return self.model(z, t_in, h, labels_dropped)
-
-        dtdt = torch.ones_like(t)
-        drdt = torch.zeros_like(r)
-
-        with torch.amp.autocast("cuda", enabled=False):
-            u_pred, dudt = torch.func.jvp(u_func, (x_t, t, r), (ut_gt, dtdt, drdt))
-            u_tgt = (ut_gt + (r_full - t_full) * dudt).detach()
-
-            loss = (u_pred - u_tgt)**2
-            loss = loss.sum(dim=(1, 2, 3))  # squared l2 loss
-            
-            # adaptive weighting
-            adp_wt = (loss.detach() + self.norm_eps) ** self.norm_p
-            loss = loss / adp_wt
-
-            if indices is not None:
-                loss = loss * weights
-
-            loss = loss.mean()  # mean over batch dimension
-
-        return loss
 
     def forward(self, x, c, percentile, global_step):
         z0 = torch.randn_like(x)
@@ -402,19 +390,3 @@ class MACWrapper:
         images.append(decoded)
 
         return images
-
-#add
-def adaptive_per_sample(self, loss_per_sample):
-    adp_wt = (loss_per_sample.detach() + self.norm_eps) ** self.norm_p
-
-    return loss_per_sample / adp_wt
-
-
-def selected_mean(self, loss_per_sample, indices):
-    if indices is None:
-        return loss_per_sample.mean()
-
-    if indices.numel() == 0:
-        return loss_per_sample.mean() * 0.0
-
-    return loss_per_sample[indices].mean()
